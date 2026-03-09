@@ -72,7 +72,7 @@ trap cleanup EXIT
 # ── Build ────────────────────────────────────────────────────────────────
 
 bold "Building vgi-entrypoint..."
-zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSmall
+zig build -Darch=x86_64
 ls -la "$BINARY"
 echo
 
@@ -127,24 +127,24 @@ echo
 bold "Running tests..."
 echo
 
-# -- Test 1: Missing VGI_DROP_CAPS ─────────────────────────────────────
-bold "[Test 1] Missing VGI_DROP_CAPS"
+# -- Test 1: Missing VGI_ENTRYPOINT_DROP_CAPS ─────────────────────────────────────
+bold "[Test 1] Missing VGI_ENTRYPOINT_DROP_CAPS"
 output=$(exec_on_machine "/usr/local/bin/vgi-entrypoint")
-assert_contains "$output" "required environment variable VGI_DROP_CAPS is not set" \
+assert_contains "$output" "required environment variable VGI_ENTRYPOINT_DROP_CAPS is not set" \
     "error message present"
 echo
 
-# -- Test 2: Empty VGI_DROP_CAPS ───────────────────────────────────────
-bold "[Test 2] Empty VGI_DROP_CAPS"
-output=$(exec_on_machine "sh -c VGI_DROP_CAPS=\ /usr/local/bin/vgi-entrypoint")
-assert_contains "$output" "VGI_DROP_CAPS is empty" \
+# -- Test 2: Empty VGI_ENTRYPOINT_DROP_CAPS ───────────────────────────────────────
+bold "[Test 2] Empty VGI_ENTRYPOINT_DROP_CAPS"
+output=$(exec_on_machine "sh -c VGI_ENTRYPOINT_DROP_CAPS=\ /usr/local/bin/vgi-entrypoint")
+assert_contains "$output" "VGI_ENTRYPOINT_DROP_CAPS is empty" \
     "error message present"
 echo
 
 # -- Test 3: Unknown capability name ───────────────────────────────────
 bold "[Test 3] Unknown capability name"
-output=$(exec_on_machine "sh -c VGI_DROP_CAPS=cap_bogus\ /usr/local/bin/vgi-entrypoint")
-assert_contains "$output" "unknown capability in VGI_DROP_CAPS" \
+output=$(exec_on_machine "sh -c VGI_ENTRYPOINT_DROP_CAPS=cap_bogus\ /usr/local/bin/vgi-entrypoint")
+assert_contains "$output" "unknown capability in VGI_ENTRYPOINT_DROP_CAPS" \
     "error message present"
 echo
 
@@ -154,7 +154,7 @@ config='{"config":{"Entrypoint":["grep","Cap","/proc/self/status"]}}'
 write_file_on_machine "/vgi-image-config" "$config" > /dev/null
 
 output=$(exec_on_machine \
-    "sh -c VGI_DROP_CAPS=cap_net_admin\ VGI_DUMP_CAPS=true\ /usr/local/bin/vgi-entrypoint")
+    "sh -c VGI_ENTRYPOINT_DROP_CAPS=cap_net_admin\ VGI_ENTRYPOINT_DUMP_CAPS=true\ /usr/local/bin/vgi-entrypoint")
 
 # Bit 12 (0x1000) must be cleared. Full caps = ffffffffff, without bit 12 = ffffffefff.
 assert_contains "$output" "CapBnd:	000001ffffffefff" \
@@ -174,7 +174,7 @@ echo
 # -- Test 5: Multiple caps dropped (reuses config from test 4) ────────
 bold "[Test 5] Drop multiple caps (cap_net_admin,cap_net_raw)"
 output=$(exec_on_machine \
-    "sh -c VGI_DROP_CAPS=cap_net_admin,cap_net_raw\ /usr/local/bin/vgi-entrypoint")
+    "sh -c VGI_ENTRYPOINT_DROP_CAPS=cap_net_admin,cap_net_raw\ /usr/local/bin/vgi-entrypoint")
 
 # Bits 12+13 (0x3000) cleared: ffffffffff -> ffffffcfff
 assert_contains "$output" "CapBnd:	000001ffffffcfff" \
@@ -187,7 +187,7 @@ config='{"config":{"Entrypoint":["cat","/proc/self/status"]}}'
 write_file_on_machine "/vgi-image-config" "$config" > /dev/null
 
 output=$(exec_on_machine \
-    "sh -c VGI_DROP_CAPS=cap_net_admin\ /usr/local/bin/vgi-entrypoint")
+    "sh -c VGI_ENTRYPOINT_DROP_CAPS=cap_net_admin\ /usr/local/bin/vgi-entrypoint")
 
 assert_contains "$output" "NoNewPrivs:	1" \
     "NoNewPrivs is 1 in exec'd process"
@@ -199,7 +199,7 @@ config='{"config":{"Entrypoint":["echo","EXEC_WORKS"]}}'
 write_file_on_machine "/vgi-image-config" "$config" > /dev/null
 
 output=$(exec_on_machine \
-    "sh -c VGI_DROP_CAPS=cap_net_admin\ /usr/local/bin/vgi-entrypoint")
+    "sh -c VGI_ENTRYPOINT_DROP_CAPS=cap_net_admin\ /usr/local/bin/vgi-entrypoint")
 
 assert_contains "$output" "EXEC_WORKS" \
     "exec'd process produced expected output"

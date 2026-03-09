@@ -170,9 +170,9 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
-    const config_path = std.posix.getenv("VGI_IMAGE_CONFIG_FILE") orelse "/vgi-image-config";
-    const dry_run = getEnvBool("VGI_DRY_RUN", false);
-    const debug = getEnvBool("VGI_DEBUG", false);
+    const config_path = std.posix.getenv("VGI_ENTRYPOINT_IMAGE_CONFIG_FILE") orelse "/vgi-image-config";
+    const dry_run = getEnvBool("VGI_ENTRYPOINT_DRY_RUN", false);
+    const debug = getEnvBool("VGI_ENTRYPOINT_DEBUG", false);
 
     logMsg("version {s}", .{build_options.version});
 
@@ -191,9 +191,9 @@ pub fn main() !void {
         return;
     }
 
-    const dump_caps = getEnvBool("VGI_DUMP_CAPS", false);
-    const no_new_privs = getEnvBool("VGI_NO_NEW_PRIVS", true);
-    const drop_caps_env = requireEnv("VGI_DROP_CAPS");
+    const dump_caps = getEnvBool("VGI_ENTRYPOINT_DUMP_CAPS", false);
+    const no_new_privs = getEnvBool("VGI_ENTRYPOINT_NO_NEW_PRIVS", true);
+    const drop_caps_env = requireEnv("VGI_ENTRYPOINT_DROP_CAPS");
 
     if (debug) {
         debugMsg("VGI_DROP_CAPS={s}", .{drop_caps_env});
