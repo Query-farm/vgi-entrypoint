@@ -1,0 +1,414 @@
+const std = @import("std");
+const caps = @import("caps.zig");
+const dump = @import("dump.zig");
+
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    logMsg(fmt, args);
+    std.process.exit(1);
+}
+
+fn logMsg(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var writer = std.fs.File.stderr().writer(&buf);
+    writer.interface.print("vgi-entrypoint: " ++ fmt ++ "\n", args) catch {};
+    writer.interface.flush() catch {};
+}
+
+/// Read a file, fataling on any error.
+fn readFile(allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err|
+        fatal("cannot open file '{s}': {}", .{ path, err });
+    defer file.close();
+    return file.readToEndAlloc(allocator, 1024 * 1024) catch |err|
+        fatal("cannot read file '{s}': {}", .{ path, err });
+}
+
+const ImageConfig = struct {
+    entrypoint: ?[]const [:0]const u8,
+    cmd: ?[]const [:0]const u8,
+};
+
+/// Convert a std.json.Value to an optional slice of sentinel-terminated strings.
+/// Returns null for .null or empty arrays.
+fn jsonValueToStringArray(allocator: std.mem.Allocator, value: std.json.Value) !?[]const [:0]const u8 {
+    switch (value) {
+        .null => return null,
+        .array => |arr| {
+            if (arr.items.len == 0) return null;
+            var result = try allocator.alloc([:0]const u8, arr.items.len);
+            var filled: usize = 0;
+            errdefer {
+                for (result[0..filled]) |s| allocator.free(s);
+                allocator.free(result);
+            }
+            for (arr.items) |item| {
+                switch (item) {
+                    .string => |s| {
+                        result[filled] = try allocator.dupeZ(u8, s);
+                        filled += 1;
+                    },
+                    else => return error.ExpectedStringElement,
+                }
+            }
+            return result;
+        },
+        else => return error.ExpectedArrayOrNull,
+    }
+}
+
+/// Parse a Docker image config JSON and extract Entrypoint and Cmd.
+fn parseImageConfig(allocator: std.mem.Allocator, content: []const u8) !ImageConfig {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return error.ExpectedObject,
+    };
+
+    const config_val = root_obj.get("config") orelse return error.MissingConfig;
+    const config_obj = switch (config_val) {
+        .object => |o| o,
+        else => return error.ExpectedObject,
+    };
+
+    const ep_val = config_obj.get("Entrypoint") orelse std.json.Value.null;
+    const cmd_val = config_obj.get("Cmd") orelse std.json.Value.null;
+
+    const entrypoint = try jsonValueToStringArray(allocator, ep_val);
+    errdefer if (entrypoint) |ep| {
+        for (ep) |s| allocator.free(s);
+        allocator.free(ep);
+    };
+
+    const cmd = try jsonValueToStringArray(allocator, cmd_val);
+
+    return .{
+        .entrypoint = entrypoint,
+        .cmd = cmd,
+    };
+}
+
+/// Combine ENTRYPOINT and CMD per Docker rules.
+/// Both null → error.NoCommand
+/// EP only → EP
+/// CMD only → CMD
+/// Both → EP ++ CMD
+fn combineEntrypointCmd(
+    allocator: std.mem.Allocator,
+    ep: ?[]const [:0]const u8,
+    cmd: ?[]const [:0]const u8,
+) ![]const [:0]const u8 {
+    if (ep) |e| {
+        if (cmd) |c| {
+            // Both set: concatenate
+            var result = try allocator.alloc([:0]const u8, e.len + c.len);
+            @memcpy(result[0..e.len], e);
+            @memcpy(result[e.len..], c);
+            return result;
+        }
+        return e;
+    }
+    if (cmd) |c| return c;
+    return error.NoCommand;
+}
+
+fn getEnvBool(name: []const u8, default: bool) bool {
+    const val = std.posix.getenv(name) orelse return default;
+    if (std.ascii.eqlIgnoreCase(val, "true") or std.mem.eql(u8, val, "1")) return true;
+    if (std.ascii.eqlIgnoreCase(val, "false") or std.mem.eql(u8, val, "0")) return false;
+    return default;
+}
+
+fn requireEnv(name: []const u8) [:0]const u8 {
+    return std.posix.getenv(name) orelse
+        fatal("required environment variable {s} is not set", .{name});
+}
+
+/// Resolve the command to execute from the image config file.
+/// Used by both normal mode and dry-run mode.
+fn resolveCommand(allocator: std.mem.Allocator, config_path: []const u8) []const [:0]const u8 {
+    const config_content = readFile(allocator, config_path);
+
+    const image_config = parseImageConfig(allocator, config_content) catch |err| switch (err) {
+        error.InvalidJson => fatal("image config file '{s}' contains invalid JSON", .{config_path}),
+        error.ExpectedObject => fatal("image config file '{s}' has unexpected structure", .{config_path}),
+        error.MissingConfig => fatal("image config file '{s}' missing 'config' key", .{config_path}),
+        error.ExpectedStringElement => fatal("image config file '{s}' has non-string array elements in Entrypoint/Cmd", .{config_path}),
+        error.ExpectedArrayOrNull => fatal("image config file '{s}' has invalid Entrypoint/Cmd value (expected array or null)", .{config_path}),
+        else => fatal("failed to parse image config file '{s}': {}", .{ config_path, err }),
+    };
+
+    return combineEntrypointCmd(allocator, image_config.entrypoint, image_config.cmd) catch
+        fatal("neither entrypoint nor cmd is set; nothing to execute", .{});
+}
+
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    const config_path = std.posix.getenv("VGI_IMAGE_CONFIG_FILE") orelse "/vgi-image-config";
+    const dry_run = getEnvBool("VGI_DRY_RUN", false);
+
+    if (dry_run) {
+        const argv_strs = resolveCommand(allocator, config_path);
+        // Print resolved command as JSON array to stdout
+        var buf: [4096]u8 = undefined;
+        var writer = std.fs.File.stdout().writer(&buf);
+        writer.interface.print("{f}\n", .{std.json.fmt(argv_strs, .{})}) catch fatal("write failed", .{});
+        writer.interface.flush() catch fatal("write failed", .{});
+        return;
+    }
+
+    const dump_caps = getEnvBool("VGI_DUMP_CAPS", false);
+    const no_new_privs = getEnvBool("VGI_NO_NEW_PRIVS", true);
+    const drop_caps_env = requireEnv("VGI_DROP_CAPS");
+
+    // Parse caps to drop
+    var cap_list: [64]u8 = undefined;
+    const cap_count = caps.parseCapList(drop_caps_env, &cap_list) catch |err| switch (err) {
+        error.UnknownCapability => fatal("unknown capability in VGI_DROP_CAPS: {s}", .{drop_caps_env}),
+        error.TooManyCapabilities => fatal("too many capabilities in VGI_DROP_CAPS", .{}),
+    };
+
+    if (cap_count == 0) fatal("VGI_DROP_CAPS is empty; at least one capability must be specified", .{});
+
+    const argv_strs = resolveCommand(allocator, config_path);
+
+    if (dump_caps) dump.dumpCapState("before drop");
+
+    // Drop caps from all sets: ambient -> {inheritable,effective,permitted} -> bounding
+    caps.dropCaps(cap_list[0..cap_count]) catch |err|
+        fatal("failed to drop capabilities: {}", .{err});
+
+    // Set no_new_privs
+    if (no_new_privs) {
+        caps.setNoNewPrivs() catch |err|
+            fatal("failed to set no_new_privs: {}", .{err});
+    }
+
+    if (dump_caps) dump.dumpCapState("after drop");
+
+    // Build argv for execve
+    var argv_buf: [256:null]?[*:0]const u8 = .{null} ** 256;
+    if (argv_strs.len > 255) fatal("too many arguments (max 255)", .{});
+    for (argv_strs, 0..) |s, i| {
+        argv_buf[i] = s.ptr;
+    }
+
+    logMsg("exec {s}", .{argv_strs[0]});
+
+    const err = std.posix.execvpeZ(argv_strs[0], &argv_buf, @ptrCast(std.os.environ.ptr));
+    fatal("execve failed for '{s}': {}", .{ argv_strs[0], err });
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+fn freeStringSlice(allocator: std.mem.Allocator, slice: []const [:0]const u8) void {
+    for (slice) |s| allocator.free(s);
+    allocator.free(slice);
+}
+
+fn expectStrings(actual: []const [:0]const u8, expected: []const []const u8) !void {
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, 0..) |e, i| {
+        try std.testing.expectEqualStrings(e, actual[i]);
+    }
+}
+
+// -- jsonValueToStringArray tests --
+
+test "jsonValueToStringArray: null value returns null" {
+    const result = try jsonValueToStringArray(std.testing.allocator, std.json.Value.null);
+    try std.testing.expect(result == null);
+}
+
+test "jsonValueToStringArray: empty array returns null" {
+    var arr = std.json.Array.init(std.testing.allocator);
+    defer arr.deinit();
+    const result = try jsonValueToStringArray(std.testing.allocator, .{ .array = arr });
+    try std.testing.expect(result == null);
+}
+
+test "jsonValueToStringArray: valid string array" {
+    const allocator = std.testing.allocator;
+    var arr = std.json.Array.init(allocator);
+    defer arr.deinit();
+    try arr.append(.{ .string = "echo" });
+    try arr.append(.{ .string = "hello" });
+    const result = (try jsonValueToStringArray(allocator, .{ .array = arr })).?;
+    defer freeStringSlice(allocator, result);
+    try expectStrings(result, &.{ "echo", "hello" });
+}
+
+test "jsonValueToStringArray: non-string elements" {
+    const allocator = std.testing.allocator;
+    var arr = std.json.Array.init(allocator);
+    defer arr.deinit();
+    try arr.append(.{ .integer = 42 });
+    try std.testing.expectError(
+        error.ExpectedStringElement,
+        jsonValueToStringArray(allocator, .{ .array = arr }),
+    );
+}
+
+test "jsonValueToStringArray: non-array non-null" {
+    try std.testing.expectError(
+        error.ExpectedArrayOrNull,
+        jsonValueToStringArray(std.testing.allocator, .{ .integer = 42 }),
+    );
+}
+
+// -- parseImageConfig tests --
+
+test "parseImageConfig: both entrypoint and cmd" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":["python"],"Cmd":["app.py","--port","8080"]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer {
+        if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
+        if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
+    }
+    try expectStrings(config.entrypoint.?, &.{"python"});
+    try expectStrings(config.cmd.?, &.{ "app.py", "--port", "8080" });
+}
+
+test "parseImageConfig: entrypoint only" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":["/entrypoint.sh"]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
+    try expectStrings(config.entrypoint.?, &.{"/entrypoint.sh"});
+    try std.testing.expect(config.cmd == null);
+}
+
+test "parseImageConfig: cmd only" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Cmd":["echo","hi"]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
+    try std.testing.expect(config.entrypoint == null);
+    try expectStrings(config.cmd.?, &.{ "echo", "hi" });
+}
+
+test "parseImageConfig: null values" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":null,"Cmd":null}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    try std.testing.expect(config.entrypoint == null);
+    try std.testing.expect(config.cmd == null);
+}
+
+test "parseImageConfig: missing keys" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    try std.testing.expect(config.entrypoint == null);
+    try std.testing.expect(config.cmd == null);
+}
+
+test "parseImageConfig: empty arrays" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":[],"Cmd":[]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    try std.testing.expect(config.entrypoint == null);
+    try std.testing.expect(config.cmd == null);
+}
+
+test "parseImageConfig: extra fields ignored" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":["echo"],"Cmd":["hi"],"Shell":["/bin/bash","-c"],"ArgsEscaped":true,"Env":["PATH=/usr/bin"]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer {
+        if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
+        if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
+    }
+    try expectStrings(config.entrypoint.?, &.{"echo"});
+    try expectStrings(config.cmd.?, &.{"hi"});
+}
+
+test "parseImageConfig: invalid JSON" {
+    try std.testing.expectError(
+        error.InvalidJson,
+        parseImageConfig(std.testing.allocator, "not json"),
+    );
+}
+
+test "parseImageConfig: missing config key" {
+    try std.testing.expectError(
+        error.MissingConfig,
+        parseImageConfig(std.testing.allocator, "{}"),
+    );
+}
+
+test "parseImageConfig: config is not object" {
+    try std.testing.expectError(
+        error.ExpectedObject,
+        parseImageConfig(std.testing.allocator, "{\"config\":42}"),
+    );
+}
+
+test "parseImageConfig: non-string entrypoint elements" {
+    try std.testing.expectError(
+        error.ExpectedStringElement,
+        parseImageConfig(std.testing.allocator, "{\"config\":{\"Entrypoint\":[1,2]}}"),
+    );
+}
+
+// -- combineEntrypointCmd tests --
+
+test "combineEntrypointCmd: EP only" {
+    const allocator = std.testing.allocator;
+    const ep: []const [:0]const u8 = &.{ "echo", "hi" };
+    const result = try combineEntrypointCmd(allocator, ep, null);
+    try expectStrings(result, &.{ "echo", "hi" });
+}
+
+test "combineEntrypointCmd: CMD only" {
+    const allocator = std.testing.allocator;
+    const cmd: []const [:0]const u8 = &.{ "echo", "hi" };
+    const result = try combineEntrypointCmd(allocator, null, cmd);
+    try expectStrings(result, &.{ "echo", "hi" });
+}
+
+test "combineEntrypointCmd: both" {
+    const allocator = std.testing.allocator;
+    const ep: []const [:0]const u8 = &.{"python"};
+    const cmd: []const [:0]const u8 = &.{"app.py"};
+    const result = try combineEntrypointCmd(allocator, ep, cmd);
+    defer allocator.free(result);
+    try expectStrings(result, &.{ "python", "app.py" });
+}
+
+test "combineEntrypointCmd: neither" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.NoCommand,
+        combineEntrypointCmd(allocator, null, null),
+    );
+}
+
+test "getEnvBool" {
+    try std.testing.expect(getEnvBool("VGI_TEST_NONEXISTENT_VAR_12345", true) == true);
+    try std.testing.expect(getEnvBool("VGI_TEST_NONEXISTENT_VAR_12345", false) == false);
+}
+
+test {
+    _ = @import("caps.zig");
+    _ = @import("dump.zig");
+}
