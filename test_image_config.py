@@ -57,8 +57,8 @@ def run_dry_run(config: dict) -> subprocess.CompletedProcess:
         return subprocess.run(
             [str(BINARY)],
             env={
-                "VGI_DRY_RUN": "true",
-                "VGI_IMAGE_CONFIG_FILE": config_path,
+                "VGI_ENTRYPOINT_DRY_RUN": "true",
+                "VGI_ENTRYPOINT_IMAGE_CONFIG_FILE": config_path,
                 "PATH": os.environ.get("PATH", ""),
             },
             capture_output=True,
@@ -220,8 +220,8 @@ class TestSyntheticConfigs:
             result = subprocess.run(
                 [str(BINARY)],
                 env={
-                    "VGI_DRY_RUN": "true",
-                    "VGI_IMAGE_CONFIG_FILE": config_path,
+                    "VGI_ENTRYPOINT_DRY_RUN": "true",
+                    "VGI_ENTRYPOINT_IMAGE_CONFIG_FILE": config_path,
                     "PATH": os.environ.get("PATH", ""),
                 },
                 capture_output=True,
@@ -237,8 +237,8 @@ class TestSyntheticConfigs:
         result = subprocess.run(
             [str(BINARY)],
             env={
-                "VGI_DRY_RUN": "true",
-                "VGI_IMAGE_CONFIG_FILE": "/nonexistent/path",
+                "VGI_ENTRYPOINT_DRY_RUN": "true",
+                "VGI_ENTRYPOINT_IMAGE_CONFIG_FILE": "/nonexistent/path",
                 "PATH": os.environ.get("PATH", ""),
             },
             capture_output=True,

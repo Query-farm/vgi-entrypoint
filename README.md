@@ -26,15 +26,16 @@ Designed to harden containers by removing capabilities at runtime without modify
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `VGI_DROP_CAPS` | Yes | — | Comma-separated capability names to drop (e.g. `cap_net_raw,cap_sys_admin`) |
-| `VGI_IMAGE_CONFIG_FILE` | No | `/vgi-image-config` | Path to Docker image config JSON |
-| `VGI_NO_NEW_PRIVS` | No | `true` | Set the `no_new_privs` bit |
-| `VGI_DUMP_CAPS` | No | `false` | Dump capability state before and after drop (debug) |
-| `VGI_DRY_RUN` | No | `false` | Parse config and print resolved command as JSON, then exit |
+| `VGI_ENTRYPOINT_DROP_CAPS` | Yes | — | Comma-separated capability names to drop (e.g. `cap_net_raw,cap_sys_admin`) |
+| `VGI_ENTRYPOINT_IMAGE_CONFIG_FILE` | No | `/vgi-image-config` | Path to Docker image config JSON |
+| `VGI_ENTRYPOINT_NO_NEW_PRIVS` | No | `true` | Set the `no_new_privs` bit |
+| `VGI_ENTRYPOINT_DUMP_CAPS` | No | `false` | Dump capability state before and after drop (debug) |
+| `VGI_ENTRYPOINT_DRY_RUN` | No | `false` | Parse config and print resolved command as JSON, then exit |
+| `VGI_ENTRYPOINT_DEBUG` | No | `false` | Verbose debug logging (config path, caps, resolved command) |
 
 ## Supported Capabilities
 
-The following Linux capabilities are recognized by name in `VGI_DROP_CAPS` (case-insensitive):
+The following Linux capabilities are recognized by name in `VGI_ENTRYPOINT_DROP_CAPS` (case-insensitive):
 
 | Capability | # | Capability | # |
 |---|---|---|---|
