@@ -1,6 +1,21 @@
+// Copyright 2026 Query.Farm LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 const std = @import("std");
 const caps = @import("caps.zig");
 const dump = @import("dump.zig");
+const build_options = @import("build_options");
 
 fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
     logMsg(fmt, args);
@@ -11,6 +26,13 @@ fn logMsg(comptime fmt: []const u8, args: anytype) void {
     var buf: [4096]u8 = undefined;
     var writer = std.fs.File.stderr().writer(&buf);
     writer.interface.print("vgi-entrypoint: " ++ fmt ++ "\n", args) catch {};
+    writer.interface.flush() catch {};
+}
+
+fn debugMsg(comptime fmt: []const u8, args: anytype) void {
+    var buf: [4096]u8 = undefined;
+    var writer = std.fs.File.stderr().writer(&buf);
+    writer.interface.print("vgi-entrypoint: [debug] " ++ fmt ++ "\n", args) catch {};
     writer.interface.flush() catch {};
 }
 
@@ -150,6 +172,14 @@ pub fn main() !void {
 
     const config_path = std.posix.getenv("VGI_IMAGE_CONFIG_FILE") orelse "/vgi-image-config";
     const dry_run = getEnvBool("VGI_DRY_RUN", false);
+    const debug = getEnvBool("VGI_DEBUG", false);
+
+    logMsg("version {s}", .{build_options.version});
+
+    if (debug) {
+        debugMsg("config_path={s}", .{config_path});
+        debugMsg("dry_run={}", .{dry_run});
+    }
 
     if (dry_run) {
         const argv_strs = resolveCommand(allocator, config_path);
@@ -165,6 +195,12 @@ pub fn main() !void {
     const no_new_privs = getEnvBool("VGI_NO_NEW_PRIVS", true);
     const drop_caps_env = requireEnv("VGI_DROP_CAPS");
 
+    if (debug) {
+        debugMsg("VGI_DROP_CAPS={s}", .{drop_caps_env});
+        debugMsg("VGI_NO_NEW_PRIVS={}", .{no_new_privs});
+        debugMsg("VGI_DUMP_CAPS={}", .{dump_caps});
+    }
+
     // Parse caps to drop
     var cap_list: [64]u8 = undefined;
     const cap_count = caps.parseCapList(drop_caps_env, &cap_list) catch |err| switch (err) {
@@ -174,7 +210,15 @@ pub fn main() !void {
 
     if (cap_count == 0) fatal("VGI_DROP_CAPS is empty; at least one capability must be specified", .{});
 
+    if (debug) {
+        debugMsg("dropping {} capabilities", .{cap_count});
+    }
+
     const argv_strs = resolveCommand(allocator, config_path);
+
+    if (debug) {
+        debugMsg("resolved command: {s} ({} args total)", .{ argv_strs[0], argv_strs.len });
+    }
 
     if (dump_caps) dump.dumpCapState("before drop");
 
@@ -200,7 +244,7 @@ pub fn main() !void {
     logMsg("exec {s}", .{argv_strs[0]});
 
     const err = std.posix.execvpeZ(argv_strs[0], &argv_buf, @ptrCast(std.os.environ.ptr));
-    fatal("execve failed for '{s}': {}", .{ argv_strs[0], err });
+    fatal("exec failed: command='{s}' error={}", .{ argv_strs[0], err });
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
