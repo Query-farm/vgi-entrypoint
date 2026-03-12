@@ -48,6 +48,8 @@ fn readFile(allocator: std.mem.Allocator, path: []const u8) []const u8 {
 const ImageConfig = struct {
     entrypoint: ?[]const [:0]const u8,
     cmd: ?[]const [:0]const u8,
+    working_dir: ?[:0]const u8,
+    env: ?[]const [:0]const u8,
 };
 
 /// Convert a std.json.Value to an optional slice of sentinel-terminated strings.
@@ -105,10 +107,26 @@ fn parseImageConfig(allocator: std.mem.Allocator, content: []const u8) !ImageCon
     };
 
     const cmd = try jsonValueToStringArray(allocator, cmd_val);
+    errdefer if (cmd) |c| {
+        for (c) |s| allocator.free(s);
+        allocator.free(c);
+    };
+
+    const working_dir: ?[:0]const u8 = if (config_obj.get("WorkingDir")) |wd_val| switch (wd_val) {
+        .string => |s| if (s.len > 0) try allocator.dupeZ(u8, s) else null,
+        .null => null,
+        else => return error.ExpectedString,
+    } else null;
+    errdefer if (working_dir) |wd| allocator.free(wd);
+
+    const env_val = config_obj.get("Env") orelse std.json.Value.null;
+    const env = try jsonValueToStringArray(allocator, env_val);
 
     return .{
         .entrypoint = entrypoint,
         .cmd = cmd,
+        .working_dir = working_dir,
+        .env = env,
     };
 }
 
@@ -148,22 +166,80 @@ fn requireEnv(name: []const u8) [:0]const u8 {
         fatal("required environment variable {s} is not set", .{name});
 }
 
-/// Resolve the command to execute from the image config file.
-/// Used by both normal mode and dry-run mode.
-fn resolveCommand(allocator: std.mem.Allocator, config_path: []const u8) []const [:0]const u8 {
+/// Resolve the image config from the config file.
+/// Returns the parsed ImageConfig with command, working_dir, and env.
+fn resolveImageConfig(allocator: std.mem.Allocator, config_path: []const u8) ImageConfig {
     const config_content = readFile(allocator, config_path);
 
-    const image_config = parseImageConfig(allocator, config_content) catch |err| switch (err) {
+    return parseImageConfig(allocator, config_content) catch |err| switch (err) {
         error.InvalidJson => fatal("image config file '{s}' contains invalid JSON", .{config_path}),
         error.ExpectedObject => fatal("image config file '{s}' has unexpected structure", .{config_path}),
         error.MissingConfig => fatal("image config file '{s}' missing 'config' key", .{config_path}),
-        error.ExpectedStringElement => fatal("image config file '{s}' has non-string array elements in Entrypoint/Cmd", .{config_path}),
-        error.ExpectedArrayOrNull => fatal("image config file '{s}' has invalid Entrypoint/Cmd value (expected array or null)", .{config_path}),
+        error.ExpectedStringElement => fatal("image config file '{s}' has non-string array elements in Entrypoint/Cmd/Env", .{config_path}),
+        error.ExpectedArrayOrNull => fatal("image config file '{s}' has invalid Entrypoint/Cmd/Env value (expected array or null)", .{config_path}),
+        error.ExpectedString => fatal("image config file '{s}' has invalid WorkingDir value (expected string)", .{config_path}),
         else => fatal("failed to parse image config file '{s}': {}", .{ config_path, err }),
     };
+}
 
-    return combineEntrypointCmd(allocator, image_config.entrypoint, image_config.cmd) catch
-        fatal("neither entrypoint nor cmd is set; nothing to execute", .{});
+/// Extract the key portion (before '=') from an env entry.
+fn envKey(entry: [*:0]const u8) []const u8 {
+    const slice = std.mem.sliceTo(entry, 0);
+    return if (std.mem.indexOfScalar(u8, slice, '=')) |eq| slice[0..eq] else slice;
+}
+
+/// Build envp by merging image config env vars with the current process environment.
+/// Current environment takes precedence over image config values.
+/// Returns a pointer suitable for execvpeZ.
+fn buildEnvp(allocator: std.mem.Allocator, config_env: ?[]const [:0]const u8) [*:null]const ?[*:0]const u8 {
+    const current_environ: [*:null]const ?[*:0]const u8 = @ptrCast(std.os.environ.ptr);
+
+    const image_env = config_env orelse return current_environ;
+    if (image_env.len == 0) return current_environ;
+
+    // Count current env entries
+    var current_count: usize = 0;
+    while (current_environ[current_count] != null) : (current_count += 1) {}
+
+    // Collect image env entries not already in current environment
+    var extra = allocator.alloc(?[*:0]const u8, image_env.len) catch
+        fatal("out of memory building environment", .{});
+    var extra_count: usize = 0;
+
+    for (image_env) |entry| {
+        const key = if (std.mem.indexOfScalar(u8, entry, '=')) |eq| entry[0..eq] else entry;
+        var found = false;
+        for (0..current_count) |i| {
+            if (current_environ[i]) |cur| {
+                const cur_key = envKey(cur);
+                if (std.mem.eql(u8, key, cur_key)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            extra[extra_count] = entry.ptr;
+            extra_count += 1;
+        }
+    }
+
+    if (extra_count == 0) {
+        allocator.free(extra);
+        return current_environ;
+    }
+
+    // Build merged envp: current + extra + null terminator
+    var merged = allocator.allocSentinel(?[*:0]const u8, current_count + extra_count, null) catch
+        fatal("out of memory building environment", .{});
+    for (0..current_count) |i| {
+        merged[i] = current_environ[i];
+    }
+    for (0..extra_count) |i| {
+        merged[current_count + i] = extra[i];
+    }
+    allocator.free(extra);
+    return merged.ptr;
 }
 
 pub fn main() !void {
@@ -182,7 +258,9 @@ pub fn main() !void {
     }
 
     if (dry_run) {
-        const argv_strs = resolveCommand(allocator, config_path);
+        const image_config = resolveImageConfig(allocator, config_path);
+        const argv_strs = combineEntrypointCmd(allocator, image_config.entrypoint, image_config.cmd) catch
+            fatal("neither entrypoint nor cmd is set; nothing to execute", .{});
         // Print resolved command as JSON array to stdout
         var buf: [4096]u8 = undefined;
         var writer = std.fs.File.stdout().writer(&buf);
@@ -214,10 +292,20 @@ pub fn main() !void {
         debugMsg("dropping {} capabilities", .{cap_count});
     }
 
-    const argv_strs = resolveCommand(allocator, config_path);
+    const image_config = resolveImageConfig(allocator, config_path);
+    const argv_strs = combineEntrypointCmd(allocator, image_config.entrypoint, image_config.cmd) catch
+        fatal("neither entrypoint nor cmd is set; nothing to execute", .{});
 
     if (debug) {
         debugMsg("resolved command: {s} ({} args total)", .{ argv_strs[0], argv_strs.len });
+        if (image_config.working_dir) |wd| debugMsg("working_dir={s}", .{wd});
+        if (image_config.env) |env_vars| debugMsg("env vars from config: {} entries", .{env_vars.len});
+    }
+
+    // Change to working directory
+    if (image_config.working_dir) |wd| {
+        std.posix.chdir(wd) catch |chdir_err|
+            fatal("failed to chdir to '{s}': {}", .{ wd, chdir_err });
     }
 
     if (dump_caps) dump.dumpCapState("before drop");
@@ -241,9 +329,12 @@ pub fn main() !void {
         argv_buf[i] = s.ptr;
     }
 
+    // Build envp: merge image config env with current environment (current takes precedence)
+    const envp = buildEnvp(allocator, image_config.env);
+
     logMsg("exec {s}", .{argv_strs[0]});
 
-    const err = std.posix.execvpeZ(argv_strs[0], &argv_buf, @ptrCast(std.os.environ.ptr));
+    const err = std.posix.execvpeZ(argv_strs[0], &argv_buf, envp);
     fatal("exec failed: command='{s}' error={}", .{ argv_strs[0], err });
 }
 
@@ -252,6 +343,13 @@ pub fn main() !void {
 fn freeStringSlice(allocator: std.mem.Allocator, slice: []const [:0]const u8) void {
     for (slice) |s| allocator.free(s);
     allocator.free(slice);
+}
+
+fn freeImageConfig(allocator: std.mem.Allocator, config: ImageConfig) void {
+    if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
+    if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
+    if (config.env) |env| freeStringSlice(allocator, env);
+    if (config.working_dir) |wd| allocator.free(wd);
 }
 
 fn expectStrings(actual: []const [:0]const u8, expected: []const []const u8) !void {
@@ -312,10 +410,7 @@ test "parseImageConfig: both entrypoint and cmd" {
         \\{"config":{"Entrypoint":["python"],"Cmd":["app.py","--port","8080"]}}
     ;
     const config = try parseImageConfig(allocator, json);
-    defer {
-        if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
-        if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
-    }
+    defer freeImageConfig(allocator, config);
     try expectStrings(config.entrypoint.?, &.{"python"});
     try expectStrings(config.cmd.?, &.{ "app.py", "--port", "8080" });
 }
@@ -326,7 +421,7 @@ test "parseImageConfig: entrypoint only" {
         \\{"config":{"Entrypoint":["/entrypoint.sh"]}}
     ;
     const config = try parseImageConfig(allocator, json);
-    defer if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
+    defer freeImageConfig(allocator, config);
     try expectStrings(config.entrypoint.?, &.{"/entrypoint.sh"});
     try std.testing.expect(config.cmd == null);
 }
@@ -337,7 +432,7 @@ test "parseImageConfig: cmd only" {
         \\{"config":{"Cmd":["echo","hi"]}}
     ;
     const config = try parseImageConfig(allocator, json);
-    defer if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
+    defer freeImageConfig(allocator, config);
     try std.testing.expect(config.entrypoint == null);
     try expectStrings(config.cmd.?, &.{ "echo", "hi" });
 }
@@ -348,6 +443,7 @@ test "parseImageConfig: null values" {
         \\{"config":{"Entrypoint":null,"Cmd":null}}
     ;
     const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
     try std.testing.expect(config.entrypoint == null);
     try std.testing.expect(config.cmd == null);
 }
@@ -358,6 +454,7 @@ test "parseImageConfig: missing keys" {
         \\{"config":{}}
     ;
     const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
     try std.testing.expect(config.entrypoint == null);
     try std.testing.expect(config.cmd == null);
 }
@@ -368,6 +465,7 @@ test "parseImageConfig: empty arrays" {
         \\{"config":{"Entrypoint":[],"Cmd":[]}}
     ;
     const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
     try std.testing.expect(config.entrypoint == null);
     try std.testing.expect(config.cmd == null);
 }
@@ -378,12 +476,10 @@ test "parseImageConfig: extra fields ignored" {
         \\{"config":{"Entrypoint":["echo"],"Cmd":["hi"],"Shell":["/bin/bash","-c"],"ArgsEscaped":true,"Env":["PATH=/usr/bin"]}}
     ;
     const config = try parseImageConfig(allocator, json);
-    defer {
-        if (config.entrypoint) |ep| freeStringSlice(allocator, ep);
-        if (config.cmd) |cmd| freeStringSlice(allocator, cmd);
-    }
+    defer freeImageConfig(allocator, config);
     try expectStrings(config.entrypoint.?, &.{"echo"});
     try expectStrings(config.cmd.?, &.{"hi"});
+    try expectStrings(config.env.?, &.{"PATH=/usr/bin"});
 }
 
 test "parseImageConfig: invalid JSON" {
@@ -412,6 +508,37 @@ test "parseImageConfig: non-string entrypoint elements" {
         error.ExpectedStringElement,
         parseImageConfig(std.testing.allocator, "{\"config\":{\"Entrypoint\":[1,2]}}"),
     );
+}
+
+test "parseImageConfig: WorkingDir and Env" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Entrypoint":["./app"],"WorkingDir":"/app","Env":["PATH=/usr/bin","FOO=bar"]}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
+    try std.testing.expectEqualStrings("/app", config.working_dir.?);
+    try expectStrings(config.env.?, &.{ "PATH=/usr/bin", "FOO=bar" });
+}
+
+test "parseImageConfig: empty WorkingDir ignored" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Cmd":["echo"],"WorkingDir":""}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
+    try std.testing.expect(config.working_dir == null);
+}
+
+test "parseImageConfig: null WorkingDir" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"config":{"Cmd":["echo"],"WorkingDir":null}}
+    ;
+    const config = try parseImageConfig(allocator, json);
+    defer freeImageConfig(allocator, config);
+    try std.testing.expect(config.working_dir == null);
 }
 
 // -- combineEntrypointCmd tests --
